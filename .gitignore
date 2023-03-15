@@ -1,0 +1,24 @@
+# Project related
+data/
+roms/
+*.ch8
+chip8/
+
+# Builds
+target/
+
+# Temp Files
+*.orig
+*~
+*#
+.*.swp
+.*.swo
+*.tmp
+*.bak
+
+# OS X
+.DS_Store
+
+# Logging
+*.log
+/logs/
