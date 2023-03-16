@@ -14,6 +14,38 @@ const VERTICES: &[f32] = &[
 
 static DISPLAY_MATRIX: std::sync::RwLock<[u32; 64 * 32]> = std::sync::RwLock::new([1; 64 * 32]);
 
+#[no_mangle]
+#[export_name = "cls"]
+pub extern "C" fn cls() {
+    eprintln!("video: cls");
+    let mut writer = DISPLAY_MATRIX.write().unwrap();
+    for i in 0..(64*32usize) {
+        writer[i] = 0;
+    }
+}
+
+#[no_mangle]
+#[export_name = "drw"]
+pub extern "C" fn drw(mem_ptr: *const std::ffi::c_uchar, x: u8, y: u8, i: u16, n: u8) -> u8 {
+    eprintln!("video: drw 0x{:x} 0x{:x} 0x{:x} 0x{:x}", i, x, y, n);
+    let mem = unsafe { std::slice::from_raw_parts(mem_ptr, 4096) };
+    let mut ret = 0;
+
+    let mut writer = DISPLAY_MATRIX.write().unwrap();
+    for (i, byte) in mem[i as usize..(i as usize + n as usize)].iter().enumerate() {
+        for bit in 0..8 {
+            let before = writer[((x as usize + bit as usize) + 64 * (y as usize + i as usize)) % 2048];
+            writer[((x as usize + bit as usize) + 64 * (y as usize + i as usize)) % 2048] ^= ((byte & (0x80 >> bit)) >> (7 - bit)) as u32;
+            let after = writer[((x as usize + bit as usize) + 64 * (y as usize + i as usize)) % 2048];
+            if before == 1 && after == 0 {
+                ret = 1;
+            }
+        }
+
+    }
+    return ret;
+}
+
 fn keycode_to_index(key: VirtualKeyCode) -> Option<usize> {
     match key {
         VirtualKeyCode::Key1 => Some(0),
@@ -33,6 +65,17 @@ fn keycode_to_index(key: VirtualKeyCode) -> Option<usize> {
 }
 
 pub async fn run_display() {
+    // {
+    //     let reader = DISPLAY_MATRIX.read().unwrap();
+    //     for i in 0..64 {
+    //         eprint!("DISPLAY: ");
+    //         for j in 0..32 {
+    //             eprint!("{} ", reader[i + j * 64]);
+    //         }
+    //         eprintln!("");
+    //     }
+    // }
+
     let event_loop = winit::event_loop::EventLoop::new();
     let window = winit::window::WindowBuilder::new()
         .with_inner_size(winit::dpi::PhysicalSize::new(640, 320))
@@ -172,6 +215,7 @@ pub async fn run_display() {
         multiview: None,
     });
 
+    // return event_loop;
     event_loop.run(move |event, _, control_flow| {
         match event {
             Event::WindowEvent { ref event, window_id, } if window_id == window.id() => {
@@ -188,14 +232,14 @@ pub async fn run_display() {
                         input: KeyboardInput { state: ElementState::Pressed, .. },
                         ..
                     } => {
-                        let first = DISPLAY_MATRIX.read().unwrap()[0];
-                        if let Ok(mut writer) = DISPLAY_MATRIX.try_write() {
-                            for i in 0..1024 {
-                                writer[i * 2] = if first == 0 { 1 } else { 0 };
-                            }
-                        }
+                        // let first = DISPLAY_MATRIX.read().unwrap()[0];
+                        // if let Ok(mut writer) = DISPLAY_MATRIX.try_write() {
+                        //     for i in 0..1024 {
+                        //         writer[i * 2] = if first == 0 { 1 } else { 0 };
+                        //     }
+                        // }
                         queue.write_buffer(&display_matrix_buffer, 0, bytemuck::cast_slice(DISPLAY_MATRIX.read().unwrap().as_slice()));
-                        window.request_redraw();
+                        // window.request_redraw();
                     }
                     _ => {}
                 }
