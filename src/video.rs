@@ -41,7 +41,6 @@ pub extern "C" fn drw(mem_ptr: *const std::ffi::c_uchar, x: u8, y: u8, i: u16, n
                 ret = 1;
             }
         }
-
     }
     return ret;
 }
@@ -65,17 +64,6 @@ fn keycode_to_index(key: VirtualKeyCode) -> Option<usize> {
 }
 
 pub async fn run_display() {
-    // {
-    //     let reader = DISPLAY_MATRIX.read().unwrap();
-    //     for i in 0..64 {
-    //         eprint!("DISPLAY: ");
-    //         for j in 0..32 {
-    //             eprint!("{} ", reader[i + j * 64]);
-    //         }
-    //         eprintln!("");
-    //     }
-    // }
-
     let event_loop = winit::event_loop::EventLoop::new();
     let window = winit::window::WindowBuilder::new()
         .with_inner_size(winit::dpi::PhysicalSize::new(640, 320))
@@ -238,13 +226,15 @@ pub async fn run_display() {
                         //         writer[i * 2] = if first == 0 { 1 } else { 0 };
                         //     }
                         // }
-                        queue.write_buffer(&display_matrix_buffer, 0, bytemuck::cast_slice(DISPLAY_MATRIX.read().unwrap().as_slice()));
+
                         // window.request_redraw();
                     }
                     _ => {}
                 }
             }
             Event::RedrawRequested(window_id) if window_id == window.id() => {
+                eprintln!("video: window redraw");
+                queue.write_buffer(&display_matrix_buffer, 0, bytemuck::cast_slice(DISPLAY_MATRIX.read().unwrap().as_slice()));
                 let output = surface.get_current_texture().unwrap();
                 let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
                 let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
