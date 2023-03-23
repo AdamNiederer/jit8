@@ -250,6 +250,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "gccjit",
+ "once_cell",
  "rand",
  "tokio",
  "wgpu",

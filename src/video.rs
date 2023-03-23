@@ -42,25 +42,10 @@ pub extern "C" fn drw(mem_ptr: *const std::ffi::c_uchar, x: u8, y: u8, i: u16, n
             }
         }
     }
-    return ret;
-}
 
-fn keycode_to_index(key: VirtualKeyCode) -> Option<usize> {
-    match key {
-        VirtualKeyCode::Key1 => Some(0),
-        VirtualKeyCode::Key2 => Some(1),
-        VirtualKeyCode::Key3 => Some(2),
-        VirtualKeyCode::Q => Some(3),
-        VirtualKeyCode::W => Some(4),
-        VirtualKeyCode::E => Some(5),
-        VirtualKeyCode::A => Some(6),
-        VirtualKeyCode::S => Some(7),
-        VirtualKeyCode::D => Some(8),
-        VirtualKeyCode::Z => Some(9),
-        VirtualKeyCode::X => Some(10),
-        VirtualKeyCode::C => Some(11),
-        _ => None
-    }
+    std::mem::drop(writer);
+    std::thread::sleep(std::time::Duration::from_micros(50000));
+    return ret;
 }
 
 pub async fn run_display() {
@@ -104,7 +89,7 @@ pub async fn run_display() {
         format: surface_format,
         width: 640,
         height: 320,
-        present_mode: surface_caps.present_modes[0],
+        present_mode: wgpu::PresentMode::AutoVsync,
         alpha_mode: surface_caps.alpha_modes[0],
         view_formats: vec![],
     };
@@ -203,7 +188,8 @@ pub async fn run_display() {
         multiview: None,
     });
 
-    // return event_loop;
+    // let mut last_frame = std::time::Instant::now();
+
     event_loop.run(move |event, _, control_flow| {
         match event {
             Event::WindowEvent { ref event, window_id, } if window_id == window.id() => {
@@ -217,23 +203,24 @@ pub async fn run_display() {
                         ..
                     } => *control_flow = ControlFlow::Exit,
                     WindowEvent::KeyboardInput {
-                        input: KeyboardInput { state: ElementState::Pressed, .. },
+                        input: KeyboardInput { .. },
                         ..
                     } => {
-                        // let first = DISPLAY_MATRIX.read().unwrap()[0];
-                        // if let Ok(mut writer) = DISPLAY_MATRIX.try_write() {
-                        //     for i in 0..1024 {
-                        //         writer[i * 2] = if first == 0 { 1 } else { 0 };
-                        //     }
-                        // }
-
-                        // window.request_redraw();
+                        if let WindowEvent::KeyboardInput { input, .. } = event {
+                            if let Some(virtual_keycode) = input.virtual_keycode {
+                                let mut writer = crate::input::KEYPAD.write().unwrap();
+                                if let Some(index) = crate::input::keycode_to_index(virtual_keycode) {
+                                    eprintln!("keypress {}={}", index, input.state == ElementState::Pressed);
+                                    writer[index] = if input.state == ElementState::Pressed { 1 } else { 0 }
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 }
+
             }
             Event::RedrawRequested(window_id) if window_id == window.id() => {
-                eprintln!("video: window redraw");
                 queue.write_buffer(&display_matrix_buffer, 0, bytemuck::cast_slice(DISPLAY_MATRIX.read().unwrap().as_slice()));
                 let output = surface.get_current_texture().unwrap();
                 let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
