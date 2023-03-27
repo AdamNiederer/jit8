@@ -1,13 +1,12 @@
 use gccjit;
+use gccjit::ToRValue as _;
 
 pub struct Chip8State<'ctx> {
-    pub st: gccjit::LValue<'ctx>,
-    pub dt: gccjit::LValue<'ctx>,
     pub i: gccjit::LValue<'ctx>,
     pub vs: Vec<gccjit::LValue<'ctx>>,
     pub mem: gccjit::LValue<'ctx>,
     pub blocks: std::collections::HashMap<u16, gccjit::Block<'ctx>>,
-    pub main: gccjit::Function<'ctx>,
+    pub functions: std::collections::HashMap<u16, gccjit::Function<'ctx>>,
     pub cls: gccjit::Function<'ctx>,
     pub rnd: gccjit::Function<'ctx>,
     pub drw: gccjit::Function<'ctx>,
@@ -38,20 +37,6 @@ static FONT: [u8; 80] = [
 
 impl<'ctx> Chip8State<'ctx> {
     pub fn new(context: &'ctx gccjit::Context<'ctx>) -> Chip8State<'ctx> {
-        let st = context.new_global(
-            None,
-            gccjit::GlobalType::Exported,
-            context.new_type::<u8>(),
-            "st",
-        );
-
-        let dt = context.new_global(
-            None,
-            gccjit::GlobalType::Exported,
-            context.new_type::<u8>(),
-            "dt",
-        );
-
         let i = context.new_global(
             None,
             gccjit::GlobalType::Exported,
@@ -76,15 +61,7 @@ impl<'ctx> Chip8State<'ctx> {
             "mem"
         );
 
-        let main = context.new_function(
-            None,
-            gccjit::FunctionType::Exported,
-            context.new_type::<()>(),
-            &[],
-            "chip8_main",
-            false,
-        );
-
+        let functions = std::collections::HashMap::new();
         let blocks = std::collections::HashMap::new();
 
         let kp = context.new_function(
@@ -158,13 +135,11 @@ impl<'ctx> Chip8State<'ctx> {
         );
 
         Chip8State {
-            st,
-            dt,
             i,
             vs,
             mem,
             blocks,
-            main,
+            functions,
             cls,
             rnd,
             drw,
@@ -178,17 +153,14 @@ impl<'ctx> Chip8State<'ctx> {
 
 pub fn recompile_rom<'ctx>(
     context: &'ctx gccjit::Context<'ctx>,
-    chip8: &'ctx Chip8State<'ctx>,
+    chip8: &'ctx mut Chip8State<'ctx>,
     path: &str
 ) -> Result<usize, anyhow::Error> {
     let rom = std::fs::read(path)?;
-    let mut blockcache = std::collections::HashMap::new();
-    blockcache.insert(512, chip8.main.new_block("entry"));
-    // context.set_dump_code_on_compile(true);
-    codegen(context, chip8, rom.as_slice(), 512, &mut blockcache)?;
+    compile_call(context, chip8, rom.as_slice(), 512)?;
     eprintln!("jit: compiling");
     let result = context.compile();
-    let main_result = result.get_function("chip8_main");
+    let main_result = result.get_function("f_0x200");
     eprintln!("jit: executing");
     let main: extern "C" fn() =
         if !main_result.is_null() {
@@ -207,31 +179,70 @@ pub extern "C" fn rnd() -> u8 {
     rand::random::<u8>()
 }
 
-pub fn codegen<'ctx>(
+pub fn compile_call<'ctx>(
     context: &'ctx gccjit::Context<'ctx>,
-    chip8: &'ctx Chip8State<'ctx>,
+    chip8: &mut Chip8State<'ctx>,
     rom: &[u8],
     address: u16,
-    blockcache: &mut std::collections::HashMap<u16, gccjit::Block<'ctx>>,
-) -> Result<(), anyhow::Error> {
-    let block = blockcache.get(&address).ok_or(anyhow::anyhow!("blockcache addr {:X} missing", address))?;
-    if address == 0x200 {
-        // Initial loading
-        for (i, byte) in FONT.iter().enumerate() {
-            let const_byte = context.new_rvalue_from_int(context.new_type::<u8>(), *byte as i32);
-            let const_mem_offset = context.new_rvalue_from_int(context.new_type::<usize>(), (0x50 + i) as i32);
-            let array = context.new_array_access(None, chip8.mem, const_mem_offset);
-            block.add_assignment(None, array, const_byte);
-        }
+) -> Result<gccjit::Function<'ctx>, anyhow::Error> {
+    let func = if let Some(func) = chip8.functions.get(&address) {
+        *func
+    } else {
+        eprintln!("jit(0x{:03x}) new function f_0x{:X}", address, address);
+        eprintln!("jit(0x{:03x}) new block f_0x{:X}_entry", address, address);
 
-        for (i, byte) in rom.iter().enumerate() {
-            let const_byte = context.new_rvalue_from_int(context.new_type::<u8>(), *byte as i32);
-            let const_mem_offset = context.new_rvalue_from_int(context.new_type::<usize>(), (512 + i) as i32);
-            let array = context.new_array_access(None, chip8.mem, const_mem_offset);
-            block.add_assignment(None, array, const_byte);
+        let func = context.new_function(
+            None,
+            gccjit::FunctionType::Exported,
+            context.new_type::<()>(),
+            &[],
+            format!("f_0x{:X}", address),
+            false,
+        );
+        chip8.functions.insert(address, func);
+
+        let block = func.new_block(format!("f_0x{:X}_entry", address));
+        chip8.blocks.insert(address, block);
+
+        if address == 0x200 {
+            bootstrap(context, chip8, rom, &block);
         }
+        codegen(context, chip8, rom, address)?;
+
+        func
+    };
+
+    Ok(func)
+}
+
+pub fn bootstrap<'ctx>(
+    context: &'ctx gccjit::Context<'ctx>,
+    chip8: &mut Chip8State<'ctx>,
+    rom: &[u8],
+    block: &gccjit::Block<'ctx>,
+) {
+    // Initial loading
+    for (i, byte) in FONT.iter().enumerate() {
+        let const_byte = context.new_rvalue_from_int(context.new_type::<u8>(), *byte as i32);
+        let const_mem_offset = context.new_rvalue_from_int(context.new_type::<usize>(), (0x50 + i) as i32);
+        let array = context.new_array_access(None, chip8.mem, const_mem_offset);
+        block.add_assignment(None, array, const_byte);
     }
 
+    for (i, byte) in rom.iter().enumerate() {
+        let const_byte = context.new_rvalue_from_int(context.new_type::<u8>(), *byte as i32);
+        let const_mem_offset = context.new_rvalue_from_int(context.new_type::<usize>(), (512 + i) as i32);
+        let array = context.new_array_access(None, chip8.mem, const_mem_offset);
+        block.add_assignment(None, array, const_byte);
+    }
+}
+
+pub fn codegen<'ctx>(
+    context: &'ctx gccjit::Context<'ctx>,
+    chip8: &mut Chip8State<'ctx>,
+    rom: &[u8],
+    address: u16,
+) -> Result<(), anyhow::Error> {
     for (i, bytes) in (&rom[address as usize - 512..]).chunks(2).enumerate() {
         let [hi, lo]: [u8; 2] = bytes.try_into()?;
         let a = (hi & 0xF0) >> 4;
@@ -240,6 +251,9 @@ pub fn codegen<'ctx>(
         let d = lo & 0x0F;
         let i_addr = address + (i as u16 * 2);
 
+        let block = chip8.blocks.get(&address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", address))?;
+        let function = block.get_function();
+
         match (a, b, c, d) {
             (0x0, 0x0, 0xE, 0x0) => {
                 eprintln!("jit(0x{:03x}) emitting cls", i_addr);
@@ -247,7 +261,7 @@ pub fn codegen<'ctx>(
                 block.add_eval(None, call);
             }
             (0x0, 0x0, 0xE, 0xE) => {
-                eprintln!("jit(0x{:03x}) emitting ret", i_addr);
+                eprintln!("jit(0x{:03x}) emitting ret for 0x{:03X}", i_addr, address);
                 // TODO: This actually needs to jump back to PC + 2
                 block.end_with_void_return(None);
                 return Ok(());
@@ -256,29 +270,31 @@ pub fn codegen<'ctx>(
                 let addr = ((x as u16) << 8) | ((y as u16) << 4) | (z as u16);
                 eprintln!("jit(0x{:03x}) emitting jp #{:X}", i_addr, addr);
 
-                if !blockcache.contains_key(&addr) {
-                    blockcache.insert(addr, chip8.main.new_block(format!("{}", addr)));
-                    codegen(context, chip8, rom, addr, blockcache)?;
-                }
+                let next = if let Some(blk) = chip8.blocks.get(&addr) {
+                    *blk
+                } else {
+                    let blk = function.new_block(format!("{:03X}", addr));
+                    chip8.blocks.insert(addr, blk);
+                    codegen(context, chip8, rom, addr)?;
+                    blk
+                };
 
-                let block2 = blockcache.get(&address).ok_or(anyhow::anyhow!("blockcache addr {:X} missing", address))?;
-                let next = blockcache.get(&addr).ok_or(anyhow::anyhow!("blockcache addr {:X} missing", addr))?;
-                block2.end_with_jump(None, *next);
+                let block = chip8.blocks.get(&address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", address))?;
+                block.end_with_jump(None, next);
                 return Ok(());
             }
             (0x2, x, y, z) => {
                 let addr = ((x as u16) << 8) | ((y as u16) << 4) | (z as u16);
                 eprintln!("jit(0x{:03x}) emitting call #{:X}", i_addr, addr);
 
-                if !blockcache.contains_key(&addr) {
-                    blockcache.insert(addr, chip8.main.new_block(format!("{}", addr)));
-                    codegen(context, chip8, rom, addr, blockcache)?;
-                }
+                let call = context.new_call(
+                    None,
+                    compile_call(context, chip8, rom, addr)?,
+                    &[],
+                );
 
-                let block2 = blockcache.get(&address).ok_or(anyhow::anyhow!("blockcache addr {:X} missing", address))?;
-                let next = blockcache.get(&addr).ok_or(anyhow::anyhow!("blockcache addr {:X} missing", addr))?;
-                block2.end_with_jump(None, *next);
-                return Ok(());
+                let block = chip8.blocks.get(&address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", address))?;
+                block.add_eval(None, call);
             }
             (0x3, vx, _, _) => {
                 eprintln!("jit(0x{:03x}) emitting se V{:X}, #{:X}", i_addr, vx, lo);
@@ -290,20 +306,26 @@ pub fn codegen<'ctx>(
                     const_val,
                 );
 
-                if !blockcache.contains_key(&(i_addr + 4)) {
-                    blockcache.insert(i_addr + 4, chip8.main.new_block(format!("{}", i_addr)));
-                    codegen(context, chip8, rom, i_addr + 4, blockcache)?;
-                }
+                let t = if let Some(blk) = chip8.blocks.get(&(i_addr + 4)) {
+                    *blk
+                } else {
+                    let blk = function.new_block(format!("{:03X}", i_addr + 4));
+                    chip8.blocks.insert(i_addr + 4, blk);
+                    codegen(context, chip8, rom, i_addr + 4)?;
+                    blk
+                };
 
-                if !blockcache.contains_key(&(i_addr + 2)) {
-                    blockcache.insert(i_addr + 2, chip8.main.new_block(format!("{}", i_addr)));
-                    codegen(context, chip8, rom, i_addr + 2, blockcache)?;
-                }
+                let f = if let Some(blk) = chip8.blocks.get(&(i_addr + 2)) {
+                    *blk
+                } else {
+                    let blk = function.new_block(format!("{:03X}", i_addr + 2));
+                    chip8.blocks.insert(i_addr + 2, blk);
+                    codegen(context, chip8, rom, i_addr + 2)?;
+                    blk
+                };
 
-                let block2 = blockcache.get(&address).ok_or(anyhow::anyhow!("blockcache addr {:X} missing", address))?;
-                let t = blockcache.get(&(i_addr + 4)).ok_or(anyhow::anyhow!("blockcache addr {:X} missing", i_addr))?;
-                let f = blockcache.get(&(i_addr + 2)).ok_or(anyhow::anyhow!("blockcache addr {:X} missing", i_addr))?;
-                block2.end_with_conditional(None, conditional, *t, *f);
+                let block = chip8.blocks.get(&address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", address))?;
+                block.end_with_conditional(None, conditional, t, f);
                 return Ok(());
             }
             (0x4, vx, _, _) => {
@@ -316,20 +338,26 @@ pub fn codegen<'ctx>(
                     const_val,
                 );
 
-                if !blockcache.contains_key(&(i_addr + 4)) {
-                    blockcache.insert(i_addr + 4, chip8.main.new_block(format!("{}", i_addr)));
-                    codegen(context, chip8, rom, i_addr + 4, blockcache)?;
-                }
+                let t = if let Some(blk) = chip8.blocks.get(&(i_addr + 4)) {
+                    *blk
+                } else {
+                    let blk = function.new_block(format!("{:03X}", i_addr + 4));
+                    chip8.blocks.insert(i_addr + 4, blk);
+                    codegen(context, chip8, rom, i_addr + 4)?;
+                    blk
+                };
 
-                if !blockcache.contains_key(&(i_addr + 2)) {
-                    blockcache.insert(i_addr + 2, chip8.main.new_block(format!("{}", i_addr)));
-                    codegen(context, chip8, rom, i_addr + 2, blockcache)?;
-                }
+                let f = if let Some(blk) = chip8.blocks.get(&(i_addr + 2)) {
+                    *blk
+                } else {
+                    let blk = function.new_block(format!("{:03X}", i_addr + 2));
+                    chip8.blocks.insert(i_addr + 2, blk);
+                    codegen(context, chip8, rom, i_addr + 2)?;
+                    blk
+                };
 
-                let block2 = blockcache.get(&address).ok_or(anyhow::anyhow!("blockcache addr {:X} missing", address))?;
-                let t = blockcache.get(&(i_addr + 4)).ok_or(anyhow::anyhow!("blockcache addr {:X} missing", i_addr))?;
-                let f = blockcache.get(&(i_addr + 2)).ok_or(anyhow::anyhow!("blockcache addr {:X} missing", i_addr))?;
-                block2.end_with_conditional(None, conditional, *t, *f);
+                let block = chip8.blocks.get(&address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", address))?;
+                block.end_with_conditional(None, conditional, t, f);
                 return Ok(());
             }
             (0x5, vx, vy, 0) => {
@@ -341,20 +369,26 @@ pub fn codegen<'ctx>(
                     chip8.vs[vy as usize],
                 );
 
-                if !blockcache.contains_key(&(i_addr + 4)) {
-                    blockcache.insert(i_addr + 4, chip8.main.new_block(format!("{}", i_addr)));
-                    codegen(context, chip8, rom, i_addr + 4, blockcache)?;
-                }
+                let t = if let Some(blk) = chip8.blocks.get(&(i_addr + 4)) {
+                    *blk
+                } else {
+                    let blk = function.new_block(format!("{:03X}", i_addr + 4));
+                    chip8.blocks.insert(i_addr + 4, blk);
+                    codegen(context, chip8, rom, i_addr + 4)?;
+                    blk
+                };
 
-                if !blockcache.contains_key(&(i_addr + 2)) {
-                    blockcache.insert(i_addr + 2, chip8.main.new_block(format!("{}", i_addr)));
-                    codegen(context, chip8, rom, i_addr + 2, blockcache)?;
-                }
+                let f = if let Some(blk) = chip8.blocks.get(&(i_addr + 2)) {
+                    *blk
+                } else {
+                    let blk = function.new_block(format!("{:03X}", i_addr + 2));
+                    chip8.blocks.insert(i_addr + 2, blk);
+                    codegen(context, chip8, rom, i_addr + 2)?;
+                    blk
+                };
 
-                let block2 = blockcache.get(&address).ok_or(anyhow::anyhow!("blockcache addr {:X} missing", address))?;
-                let t = blockcache.get(&(i_addr + 4)).ok_or(anyhow::anyhow!("blockcache addr {:X} missing", i_addr))?;
-                let f = blockcache.get(&(i_addr + 2)).ok_or(anyhow::anyhow!("blockcache addr {:X} missing", i_addr))?;
-                block2.end_with_conditional(None, conditional, *t, *f);
+                let block = chip8.blocks.get(&address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", address))?;
+                block.end_with_conditional(None, conditional, t, f);
                 return Ok(());
             }
             (0x6, vx, _, _) => {
@@ -427,7 +461,6 @@ pub fn codegen<'ctx>(
                 block.add_assignment(None, chip8.vs[vx as usize], result);
             }
             (0x8, vx, vy, 0x6) => {
-                use gccjit::ToRValue;
                 eprintln!("jit(0x{:03x}) emitting shr V{:X}, (V{:X})", i_addr, vx, vy);
                 let const_mask = context.new_rvalue_from_int(context.new_type::<u8>(), 0x1 as i32);
                 let const_shift = context.new_rvalue_from_int(context.new_type::<u8>(), 0x1 as i32);
@@ -464,10 +497,9 @@ pub fn codegen<'ctx>(
                     chip8.vs[vx as usize],
                 );
                 block.add_assignment(None, chip8.vs[vx as usize], result);
-                block.add_assignment(None, chip8.vs[0xF], carry);
+                block.add_assignment(None, chip8.vs[0xF], context.new_cast(None, carry, context.new_type::<u8>()));
             }
             (0x8, vx, vy, 0xE) => {
-                use gccjit::ToRValue;
                 eprintln!("jit(0x{:03x}) emitting shl V{:X}, (V{:X})", i_addr, vx, vy);
                 let const_mask = context.new_rvalue_from_int(context.new_type::<u8>(), 0x80 as i32);
                 let const_mask_shift = context.new_rvalue_from_int(context.new_type::<u8>(), 7 as i32);
@@ -506,20 +538,26 @@ pub fn codegen<'ctx>(
                     chip8.vs[vy as usize],
                 );
 
-                if !blockcache.contains_key(&(i_addr + 4)) {
-                    blockcache.insert(i_addr + 4, chip8.main.new_block(format!("{}", i_addr)));
-                    codegen(context, chip8, rom, i_addr + 4, blockcache)?;
-                }
+                let t = if let Some(blk) = chip8.blocks.get(&(i_addr + 4)) {
+                    *blk
+                } else {
+                    let blk = function.new_block(format!("{:03X}", i_addr + 4));
+                    chip8.blocks.insert(i_addr + 4, blk);
+                    codegen(context, chip8, rom, i_addr + 4)?;
+                    blk
+                };
 
-                if !blockcache.contains_key(&(i_addr + 2)) {
-                    blockcache.insert(i_addr + 2, chip8.main.new_block(format!("{}", i_addr)));
-                    codegen(context, chip8, rom, i_addr + 2, blockcache)?;
-                }
+                let f = if let Some(blk) = chip8.blocks.get(&(i_addr + 2)) {
+                    *blk
+                } else {
+                    let blk = function.new_block(format!("{:03X}", i_addr + 2));
+                    chip8.blocks.insert(i_addr + 2, blk);
+                    codegen(context, chip8, rom, i_addr + 2)?;
+                    blk
+                };
 
-                let block2 = blockcache.get(&address).ok_or(anyhow::anyhow!("blockcache addr {:X} missing", address))?;
-                let t = blockcache.get(&(i_addr + 4)).ok_or(anyhow::anyhow!("blockcache addr {:X} missing", i_addr))?;
-                let f = blockcache.get(&(i_addr + 2)).ok_or(anyhow::anyhow!("blockcache addr {:X} missing", i_addr))?;
-                block2.end_with_conditional(None, conditional, *t, *f);
+                let block = chip8.blocks.get(&address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", address))?;
+                block.end_with_conditional(None, conditional, t, f);
                 return Ok(());
             }
             (0xA, x, y, z) => {
@@ -548,7 +586,6 @@ pub fn codegen<'ctx>(
                 block.add_assignment(None, chip8.vs[vx as usize], and_result);
             }
             (0xD, vx, vy, n) => {
-                use gccjit::ToRValue;
                 eprintln!("jit(0x{:03x}) emitting drw V{:X}, V{:X}, #{:X}", i_addr, vx, vy, n);
                 let const_n = context.new_rvalue_from_int(context.new_type::<u8>(), n as i32);
 
@@ -563,28 +600,32 @@ pub fn codegen<'ctx>(
                 block.add_assignment(None, chip8.vs[0xF], intersection);
             }
             (0xE, vx, 0x9, 0xE) => {
-                use gccjit::ToRValue;
                 eprintln!("jit(0x{:03x}) emitting skp V{:X}", i_addr, vx);
                 let is_pressed = context.new_call(None, chip8.kp, &[chip8.vs[vx as usize].to_rvalue()]);
 
-                if !blockcache.contains_key(&(i_addr + 4)) {
-                    blockcache.insert(i_addr + 4, chip8.main.new_block(format!("{}", i_addr)));
-                    codegen(context, chip8, rom, i_addr + 4, blockcache)?;
-                }
+                let t = if let Some(blk) = chip8.blocks.get(&(i_addr + 4)) {
+                    *blk
+                } else {
+                    let blk = function.new_block(format!("{:03X}", i_addr + 4));
+                    chip8.blocks.insert(i_addr + 4, blk);
+                    codegen(context, chip8, rom, i_addr + 4)?;
+                    blk
+                };
 
-                if !blockcache.contains_key(&(i_addr + 2)) {
-                    blockcache.insert(i_addr + 2, chip8.main.new_block(format!("{}", i_addr)));
-                    codegen(context, chip8, rom, i_addr + 2, blockcache)?;
-                }
+                let f = if let Some(blk) = chip8.blocks.get(&(i_addr + 2)) {
+                    *blk
+                } else {
+                    let blk = function.new_block(format!("{:03X}", i_addr + 2));
+                    chip8.blocks.insert(i_addr + 2, blk);
+                    codegen(context, chip8, rom, i_addr + 2)?;
+                    blk
+                };
 
-                let block2 = blockcache.get(&address).ok_or(anyhow::anyhow!("blockcache addr {:X} missing", address))?;
-                let t = blockcache.get(&(i_addr + 4)).ok_or(anyhow::anyhow!("blockcache addr {:X} missing", i_addr))?;
-                let f = blockcache.get(&(i_addr + 2)).ok_or(anyhow::anyhow!("blockcache addr {:X} missing", i_addr))?;
-                block2.end_with_conditional(None, context.new_cast(None, is_pressed, context.new_type::<bool>()), *t, *f);
+                let block = chip8.blocks.get(&address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", address))?;
+                block.end_with_conditional(None, context.new_cast(None, is_pressed, context.new_type::<bool>()), t, f);
                 return Ok(());
             }
             (0xE, vx, 0xA, 0x1) => {
-                use gccjit::ToRValue;
                 eprintln!("jit(0x{:03x}) emitting sknp V{:X}", i_addr, vx);
                 let is_pressed = context.new_call(None, chip8.kp, &[chip8.vs[vx as usize].to_rvalue()]);
                 let is_not_pressed = context.new_unary_op(
@@ -594,20 +635,26 @@ pub fn codegen<'ctx>(
                     context.new_cast(None, is_pressed, context.new_type::<bool>())
                 );
 
-                if !blockcache.contains_key(&(i_addr + 4)) {
-                    blockcache.insert(i_addr + 4, chip8.main.new_block(format!("{}", i_addr)));
-                    codegen(context, chip8, rom, i_addr + 4, blockcache)?;
-                }
+                let t = if let Some(blk) = chip8.blocks.get(&(i_addr + 4)) {
+                    *blk
+                } else {
+                    let blk = function.new_block(format!("{:03X}", i_addr + 4));
+                    chip8.blocks.insert(i_addr + 4, blk);
+                    codegen(context, chip8, rom, i_addr + 4)?;
+                    blk
+                };
 
-                if !blockcache.contains_key(&(i_addr + 2)) {
-                    blockcache.insert(i_addr + 2, chip8.main.new_block(format!("{}", i_addr)));
-                    codegen(context, chip8, rom, i_addr + 2, blockcache)?;
-                }
+                let f = if let Some(blk) = chip8.blocks.get(&(i_addr + 2)) {
+                    *blk
+                } else {
+                    let blk = function.new_block(format!("{:03X}", i_addr + 2));
+                    chip8.blocks.insert(i_addr + 2, blk);
+                    codegen(context, chip8, rom, i_addr + 2)?;
+                    blk
+                };
 
-                let block2 = blockcache.get(&address).ok_or(anyhow::anyhow!("blockcache addr {:X} missing", address))?;
-                let t = blockcache.get(&(i_addr + 4)).ok_or(anyhow::anyhow!("blockcache addr {:X} missing", i_addr))?;
-                let f = blockcache.get(&(i_addr + 2)).ok_or(anyhow::anyhow!("blockcache addr {:X} missing", i_addr))?;
-                block2.end_with_conditional(None, is_not_pressed, *t, *f);
+                let block = chip8.blocks.get(&address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", address))?;
+                block.end_with_conditional(None, is_not_pressed, t, f);
                 return Ok(());
             }
             (0xF, vx, 0x0, 0x7) => {
@@ -621,10 +668,12 @@ pub fn codegen<'ctx>(
                 block.add_assignment(None, chip8.vs[vx as usize], key_result);
             }
             (0xF, vx, 0x1, 0x5) => {
-                use gccjit::ToRValue;
                 eprintln!("jit(0x{:03x}) emitting ld DT, V{:X}", i_addr, vx);
                 let dt_result = context.new_call(None, chip8.stdt, &[chip8.vs[vx as usize].to_rvalue()]);
                 block.add_eval(None, dt_result);
+            }
+            (0xF, vx, 0x1, 0x8) => {
+                eprintln!("jit(0x{:03x}) emitting ld ST, V{:X} (TODO)", i_addr, vx);
             }
             (0xF, vx, 0x1, 0xE) => {
                 eprintln!("jit(0x{:03x}) emitting add I, V{:X}", i_addr, vx);
@@ -647,9 +696,9 @@ pub fn codegen<'ctx>(
                 eprintln!("jit(0x{:03x}) emitting bcd [I], V{:X} (flushing jit cache)", i_addr, vx);
                 let const_hundred = context.new_rvalue_from_int(context.new_type::<u8>(), 100 as i32);
                 let const_ten = context.new_rvalue_from_int(context.new_type::<u8>(), 10 as i32);
-                let const_zero = context.new_rvalue_from_int(context.new_type::<u8>(), 10 as i32);
-                let const_one = context.new_rvalue_from_int(context.new_type::<u8>(), 10 as i32);
-                let const_two = context.new_rvalue_from_int(context.new_type::<u8>(), 10 as i32);
+                let const_zero = context.new_rvalue_from_int(context.new_type::<u8>(), 0 as i32);
+                let const_one = context.new_rvalue_from_int(context.new_type::<u8>(), 1 as i32);
+                let const_two = context.new_rvalue_from_int(context.new_type::<u8>(), 2 as i32);
                 let hundreds_digit = context.new_binary_op(
                     None,
                     gccjit::BinaryOp::Divide,
@@ -702,11 +751,15 @@ pub fn codegen<'ctx>(
                 }
             }
             _ => {
-                eprintln!("jit(0x{:03x}) unknown insn {:X} {:X}, aborting", i, hi, lo);
-                break;
+                eprintln!("jit(0x{:03x}) unknown insn {:X} {:X}, aborting", i_addr, hi, lo);
+                return Ok(());
             }
         }
     }
-    block.end_with_void_return(None);
-    Ok(())
+    {
+        eprintln!("jit: returning for end of rom");
+        let block = chip8.blocks.get(&address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", address))?;
+        block.end_with_void_return(None);
+        Ok(())
+    }
 }

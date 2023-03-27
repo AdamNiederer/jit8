@@ -44,7 +44,7 @@ pub extern "C" fn drw(mem_ptr: *const std::ffi::c_uchar, x: u8, y: u8, i: u16, n
     }
 
     std::mem::drop(writer);
-    std::thread::sleep(std::time::Duration::from_micros(50000));
+    std::thread::sleep(std::time::Duration::from_micros(10000));
     return ret;
 }
 
