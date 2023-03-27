@@ -2,22 +2,26 @@ use winit::event::VirtualKeyCode;
 use std::sync::RwLock;
 use std::time::Duration;
 
-pub static KEYPAD: RwLock<[u8; 12]> = RwLock::new([0; 12]);
+pub static KEYPAD: RwLock<[u8; 16]> = RwLock::new([0; 16]);
 
 pub fn keycode_to_index(key: VirtualKeyCode) -> Option<usize> {
     match key {
-        VirtualKeyCode::Key1 => Some(0),
-        VirtualKeyCode::Key2 => Some(1),
-        VirtualKeyCode::Key3 => Some(2),
-        VirtualKeyCode::Q => Some(3),
-        VirtualKeyCode::W => Some(4),
-        VirtualKeyCode::E => Some(5),
-        VirtualKeyCode::A => Some(6),
-        VirtualKeyCode::S => Some(7),
-        VirtualKeyCode::D => Some(8),
-        VirtualKeyCode::Z => Some(9),
-        VirtualKeyCode::X => Some(10),
-        VirtualKeyCode::C => Some(11),
+        VirtualKeyCode::Key1 => Some(0x0),
+        VirtualKeyCode::Key2 => Some(0x1),
+        VirtualKeyCode::Key3 => Some(0x2),
+        VirtualKeyCode::Key4 => Some(0xC),
+        VirtualKeyCode::Q => Some(0x3),
+        VirtualKeyCode::W => Some(0x4),
+        VirtualKeyCode::E => Some(0x5),
+        VirtualKeyCode::R => Some(0xD),
+        VirtualKeyCode::A => Some(0x6),
+        VirtualKeyCode::S => Some(0x7),
+        VirtualKeyCode::D => Some(0x8),
+        VirtualKeyCode::F => Some(0xE),
+        VirtualKeyCode::Z => Some(0x9),
+        VirtualKeyCode::X => Some(0x10),
+        VirtualKeyCode::C => Some(0x11),
+        VirtualKeyCode::V => Some(0xF),
         _ => None
     }
 }
@@ -26,11 +30,14 @@ pub fn keycode_to_index(key: VirtualKeyCode) -> Option<usize> {
 #[export_name = "kp"]
 pub extern "C" fn kp(key: u8) -> u8 {
     let reader = KEYPAD.read().unwrap();
-    eprintln!("kp: {}={}", key, reader[(key % 12) as usize]);
-    if key >= 12 || key == 0 {
+    if key >= 16 {
         eprintln!("input: kp invalid key: {}", key);
     }
-    reader[(key % 12) as usize]
+    eprintln!("kp: {}={}", key, reader[(key % 16) as usize]);
+    let ret = reader[(key % 16) as usize];
+    drop(reader);
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    ret
 }
 
 fn is_pressed(old: &[u8], new: &[u8]) -> Option<usize> {
