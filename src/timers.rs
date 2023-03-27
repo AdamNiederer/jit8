@@ -8,7 +8,7 @@ static DELAY_VALUE: RwLock<u8> = RwLock::new(0);
 #[no_mangle]
 #[export_name = "stdt"]
 pub extern "C" fn stdt(val: u8) {
-    eprintln!("timers: stdt");
+    // eprintln!("timers: stdt");
     let mut timer = DELAY_TIMER.write().unwrap();
     let mut value = DELAY_VALUE.write().unwrap();
     **timer = Instant::now();
@@ -18,7 +18,7 @@ pub extern "C" fn stdt(val: u8) {
 #[no_mangle]
 #[export_name = "lddt"]
 pub extern "C" fn lddt() -> u8 {
-    eprintln!("timers: lddt");
+    // eprintln!("timers: lddt");
     let timer = DELAY_TIMER.read().unwrap();
     let value = DELAY_VALUE.read().unwrap();
     *value - ((Instant::now().duration_since(**timer).as_millis() as f32 / 16.666) as u8)

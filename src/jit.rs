@@ -1,12 +1,14 @@
 use gccjit;
 use gccjit::ToRValue as _;
+use std::collections::HashMap;
 
 pub struct Chip8State<'ctx> {
     pub i: gccjit::LValue<'ctx>,
     pub vs: Vec<gccjit::LValue<'ctx>>,
     pub mem: gccjit::LValue<'ctx>,
-    pub blocks: std::collections::HashMap<u16, gccjit::Block<'ctx>>,
-    pub functions: std::collections::HashMap<u16, gccjit::Function<'ctx>>,
+    pub blocks: HashMap<u16, gccjit::Block<'ctx>>,
+    pub functions: HashMap<u16, gccjit::Function<'ctx>>,
+    pub stack: Vec<u16>,
     pub cls: gccjit::Function<'ctx>,
     pub rnd: gccjit::Function<'ctx>,
     pub drw: gccjit::Function<'ctx>,
@@ -61,8 +63,9 @@ impl<'ctx> Chip8State<'ctx> {
             "mem"
         );
 
-        let functions = std::collections::HashMap::new();
-        let blocks = std::collections::HashMap::new();
+        let blocks = HashMap::new();
+        let functions = HashMap::new();
+        let stack = Vec::new();
 
         let kp = context.new_function(
             None,
@@ -140,6 +143,7 @@ impl<'ctx> Chip8State<'ctx> {
             mem,
             blocks,
             functions,
+            stack,
             cls,
             rnd,
             drw,
@@ -151,26 +155,97 @@ impl<'ctx> Chip8State<'ctx> {
     }
 }
 
+#[derive(Debug)]
+pub enum JitResult {
+    SelfModifyingCode { pc: u16, len: usize },
+    DynamicJump { pc: u16 },
+    EndOfProgram,
+}
+
 pub fn recompile_rom<'ctx>(
     context: &'ctx gccjit::Context<'ctx>,
     chip8: &'ctx mut Chip8State<'ctx>,
     path: &str
 ) -> Result<usize, anyhow::Error> {
-    let rom = std::fs::read(path)?;
-    compile_call(context, chip8, rom.as_slice(), 512)?;
-    eprintln!("jit: compiling");
-    let result = context.compile();
-    let main_result = result.get_function("f_0x200");
-    eprintln!("jit: executing");
-    let main: extern "C" fn() =
-        if !main_result.is_null() {
-            unsafe { std::mem::transmute(main_result) }
-        }
+    let mut generation = 0;
+    let mut rom = std::fs::read(path)?;
+    let mut address = 512;
+    let mut residual_mode = false;
+    loop {
+        eprintln!("jit: jitting at addr {:03X}", address);
+        let (results, _) = compile_call(context, chip8, rom.as_slice(), None, address, residual_mode, generation)?;
+        eprintln!("jit: compiling");
+        // chip8.functions.get(&0x200).unwrap().dump_to_dot("chip8_0x200.dot");
+        let compile_result = context.compile();
+        let main_result = compile_result.get_function(format!("f_{}_0x{:03X}", generation, address));
+
+        eprintln!("jit: executing");
+        let main: extern "C" fn() =
+            if !main_result.is_null() {
+                unsafe { std::mem::transmute(main_result) }
+            }
         else {
-           panic!("failed to codegen")
+            panic!("failed to codegen")
         };
-    main();
-    Ok(0)
+
+
+        main();
+
+        residual_mode = false;
+        for result in results {
+            match result {
+                JitResult::SelfModifyingCode { pc, len } => {
+                    let mem_result = compile_result.get_global("mem");
+                    let i_result = compile_result.get_global("i");
+                    let mem: &mut [u8] = if !mem_result.is_null() {
+                        unsafe { std::slice::from_raw_parts_mut(std::mem::transmute(mem_result), 4096) }
+                    } else {
+                        panic!("failed to get mem pointer")
+                    };
+                    let i: u16 = if !mem_result.is_null() {
+                        unsafe { *std::mem::transmute::<*mut (), *mut u16>(i_result) }
+                    } else {
+                        panic!("failed to get i pointer")
+                    };
+
+                    // eprint!("jit: memdump(   ): ");
+                    // for j in 0..64 {
+                    //     eprint!("{:02X} ", j);
+                    // }
+                    //     eprintln!("");
+                    // for j in 0..64 {
+                    //     eprint!("jit: memdump({:03X}): ", j * 64);
+                    //     for k in 0..64 {
+                    //         eprint!("{:02X} ", mem[j * 64 + k]);
+                    //     }
+                    //     eprintln!("");
+                    // }
+
+                    let rom_addr = i as usize - 0x200;
+
+                    if rom_addr < rom.len() {
+                        chip8.blocks = HashMap::new();
+                        chip8.functions = HashMap::new();
+                        for j in 0..len {
+                            if rom_addr + j < rom.len() {
+                                eprintln!("jit: self-modifying code: rom[0x{:03X}/{:03X}] = mem[0x{:03X}] (0x{:02X})", rom_addr + j, rom.len(), i as usize + j, mem[i as usize + j]);
+                                rom[rom_addr + j] = mem[i as usize + j];
+                            }
+                        }
+                        generation += 1;
+                    }
+                    address = pc;
+                    residual_mode = true;
+                },
+                JitResult::DynamicJump { pc } => {
+                    address = pc;
+                    residual_mode = true;
+                },
+                JitResult::EndOfProgram => {}
+            };
+        }
+
+    }
 }
 
 #[no_mangle]
@@ -183,36 +258,38 @@ pub fn compile_call<'ctx>(
     context: &'ctx gccjit::Context<'ctx>,
     chip8: &mut Chip8State<'ctx>,
     rom: &[u8],
+    stack_address: Option<u16>,
     address: u16,
-) -> Result<gccjit::Function<'ctx>, anyhow::Error> {
-    let func = if let Some(func) = chip8.functions.get(&address) {
-        *func
+    residual_mode: bool,
+    generation: usize,
+) -> Result<(Vec<JitResult>, gccjit::Function<'ctx>), anyhow::Error> {
+    if let Some(func) = chip8.functions.get(&address) {
+        Ok((vec!(JitResult::EndOfProgram), *func))
     } else {
-        eprintln!("jit(0x{:03x}) new function f_0x{:X}", address, address);
-        eprintln!("jit(0x{:03x}) new block f_0x{:X}_entry", address, address);
+        if let Some(stack_addr) = stack_address {
+            chip8.stack.push(stack_addr);
+        }
+        eprintln!("jit(0x{:03x}) new function f_{}_0x{:X}", address, generation, address);
 
         let func = context.new_function(
             None,
             gccjit::FunctionType::Exported,
             context.new_type::<()>(),
             &[],
-            format!("f_0x{:X}", address),
+            format!("f_{}_0x{:03X}", generation, address),
             false,
         );
         chip8.functions.insert(address, func);
 
-        let block = func.new_block(format!("f_0x{:X}_entry", address));
+        let block = func.new_block(format!("f_{}_0x{:03X}_entry", generation, address));
         chip8.blocks.insert(address, block);
 
         if address == 0x200 {
             bootstrap(context, chip8, rom, &block);
         }
-        codegen(context, chip8, rom, address)?;
 
-        func
-    };
-
-    Ok(func)
+        Ok((codegen(context, chip8, rom, address, residual_mode, generation)?, func))
+    }
 }
 
 pub fn bootstrap<'ctx>(
@@ -241,63 +318,98 @@ pub fn codegen<'ctx>(
     context: &'ctx gccjit::Context<'ctx>,
     chip8: &mut Chip8State<'ctx>,
     rom: &[u8],
-    address: u16,
-) -> Result<(), anyhow::Error> {
-    for (i, bytes) in (&rom[address as usize - 512..]).chunks(2).enumerate() {
+    block_address: u16,
+    residual_mode: bool,
+    generation: usize,
+) -> Result<Vec<JitResult>, anyhow::Error> {
+    for (i, bytes) in (&rom[block_address as usize - 512..]).chunks(2).enumerate() {
         let [hi, lo]: [u8; 2] = bytes.try_into()?;
         let a = (hi & 0xF0) >> 4;
         let b = hi & 0x0F;
         let c = (lo & 0xF0) >> 4;
         let d = lo & 0x0F;
-        let i_addr = address + (i as u16 * 2);
+        let insn_address = block_address + (i as u16 * 2);
 
-        let block = chip8.blocks.get(&address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", address))?;
+        let block = chip8.blocks.get(&block_address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", block_address))?;
         let function = block.get_function();
 
         match (a, b, c, d) {
+            (0x0, 0x0, 0x0, 0x0) => {
+                eprintln!("jit(0x{:03x}) detected uninitialized memory, ignoring (probably self-modifying code)", insn_address);
+            }
             (0x0, 0x0, 0xE, 0x0) => {
-                eprintln!("jit(0x{:03x}) emitting cls", i_addr);
+                eprintln!("jit(0x{:03x}) emitting cls", insn_address);
                 let call = context.new_call(None, chip8.cls, &[]);
                 block.add_eval(None, call);
             }
             (0x0, 0x0, 0xE, 0xE) => {
-                eprintln!("jit(0x{:03x}) emitting ret for 0x{:03X}", i_addr, address);
-                // TODO: This actually needs to jump back to PC + 2
+                eprintln!("jit(0x{:03x}) emitting ret for 0x{:03X}", insn_address, block_address);
+
+                if residual_mode {
+                    let next_addr = chip8.stack.pop();
+                    eprintln!("jit: next addr for residual mode: 0x{:03X}", next_addr.unwrap_or(0));
+                    if let Some(addr) = next_addr {
+                        let (next_result, next) = if let Some(blk) = chip8.blocks.get(&addr) {
+                            (vec!(JitResult::EndOfProgram), *blk)
+                        } else {
+                            let blk = function.new_block(format!("{}_{:03X}", generation, addr));
+                            chip8.blocks.insert(addr, blk);
+                            (codegen(context, chip8, rom, addr, residual_mode, generation)?, blk)
+                        };
+                        let block = chip8.blocks.get(&block_address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", block_address))?;
+                        block.end_with_jump(None, next);
+                        return Ok(next_result);
+                    }
+                }
+
+                let block = chip8.blocks.get(&block_address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", block_address))?;
                 block.end_with_void_return(None);
-                return Ok(());
+
+                return Ok(vec!(JitResult::EndOfProgram));
             }
             (0x1, x, y, z) => {
                 let addr = ((x as u16) << 8) | ((y as u16) << 4) | (z as u16);
-                eprintln!("jit(0x{:03x}) emitting jp #{:X}", i_addr, addr);
+                eprintln!("jit(0x{:03x}) emitting jp #{:X}", insn_address, addr);
 
-                let next = if let Some(blk) = chip8.blocks.get(&addr) {
-                    *blk
+                let (next_result, next) = if let Some(blk) = chip8.blocks.get(&addr) {
+                    (vec!(JitResult::EndOfProgram), *blk)
                 } else {
-                    let blk = function.new_block(format!("{:03X}", addr));
+                    let blk = function.new_block(format!("{}_{:03X}", generation, addr));
                     chip8.blocks.insert(addr, blk);
-                    codegen(context, chip8, rom, addr)?;
-                    blk
+                    (codegen(context, chip8, rom, addr, residual_mode, generation)?, blk)
                 };
 
-                let block = chip8.blocks.get(&address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", address))?;
+                let block = chip8.blocks.get(&block_address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", block_address))?;
                 block.end_with_jump(None, next);
-                return Ok(());
+                return Ok(next_result);
             }
             (0x2, x, y, z) => {
                 let addr = ((x as u16) << 8) | ((y as u16) << 4) | (z as u16);
-                eprintln!("jit(0x{:03x}) emitting call #{:X}", i_addr, addr);
+                eprintln!("jit(0x{:03x}) emitting call #{:X}", insn_address, addr);
+
+                let (results, function) = compile_call(context, chip8, rom, Some(insn_address + 2), addr, false, generation)?;
 
                 let call = context.new_call(
                     None,
-                    compile_call(context, chip8, rom, addr)?,
+                    function,
                     &[],
                 );
 
-                let block = chip8.blocks.get(&address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", address))?;
+                let block = chip8.blocks.get(&block_address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", block_address))?;
                 block.add_eval(None, call);
+
+                for result in results.iter() {
+                    match result {
+                        JitResult::EndOfProgram => {}
+                        _ => {
+                            block.end_with_void_return(None);
+                            return Ok(results);
+                        }
+                    }
+                }
             }
             (0x3, vx, _, _) => {
-                eprintln!("jit(0x{:03x}) emitting se V{:X}, #{:X}", i_addr, vx, lo);
+                eprintln!("jit(0x{:03x}) emitting se V{:X}, #{:X}", insn_address, vx, lo);
                 let const_val = context.new_rvalue_from_int(context.new_type::<u8>(), lo as i32);
                 let conditional = context.new_comparison(
                     None,
@@ -306,30 +418,30 @@ pub fn codegen<'ctx>(
                     const_val,
                 );
 
-                let t = if let Some(blk) = chip8.blocks.get(&(i_addr + 4)) {
-                    *blk
+                let (mut t_results, t) = if let Some(blk) = chip8.blocks.get(&(insn_address + 4)) {
+                    (vec!(JitResult::EndOfProgram), *blk)
                 } else {
-                    let blk = function.new_block(format!("{:03X}", i_addr + 4));
-                    chip8.blocks.insert(i_addr + 4, blk);
-                    codegen(context, chip8, rom, i_addr + 4)?;
-                    blk
+                    let blk = function.new_block(format!("{}_{:03X}", generation, insn_address + 4));
+                    chip8.blocks.insert(insn_address + 4, blk);
+                    (codegen(context, chip8, rom, insn_address + 4, residual_mode, generation)?, blk)
                 };
 
-                let f = if let Some(blk) = chip8.blocks.get(&(i_addr + 2)) {
-                    *blk
+                let (mut f_results, f) = if let Some(blk) = chip8.blocks.get(&(insn_address + 2)) {
+                    (vec!(JitResult::EndOfProgram), *blk)
                 } else {
-                    let blk = function.new_block(format!("{:03X}", i_addr + 2));
-                    chip8.blocks.insert(i_addr + 2, blk);
-                    codegen(context, chip8, rom, i_addr + 2)?;
-                    blk
+                    let blk = function.new_block(format!("{}_{:03X}", generation, insn_address + 2));
+                    chip8.blocks.insert(insn_address + 2, blk);
+                    (codegen(context, chip8, rom, insn_address + 2, residual_mode, generation)?, blk)
                 };
 
-                let block = chip8.blocks.get(&address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", address))?;
+                let block = chip8.blocks.get(&block_address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", block_address))?;
                 block.end_with_conditional(None, conditional, t, f);
-                return Ok(());
+
+                t_results.append(&mut f_results);
+                return Ok(t_results);
             }
             (0x4, vx, _, _) => {
-                eprintln!("jit(0x{:03x}) emitting sne V{:X}, #{:X}", i_addr, vx, lo);
+                eprintln!("jit(0x{:03x}) emitting sne V{:X}, #{:X}", insn_address, vx, lo);
                 let const_val = context.new_rvalue_from_int(context.new_type::<u8>(), lo as i32);
                 let conditional = context.new_comparison(
                     None,
@@ -338,30 +450,30 @@ pub fn codegen<'ctx>(
                     const_val,
                 );
 
-                let t = if let Some(blk) = chip8.blocks.get(&(i_addr + 4)) {
-                    *blk
+                let (mut t_results, t) = if let Some(blk) = chip8.blocks.get(&(insn_address + 4)) {
+                    (vec!(JitResult::EndOfProgram), *blk)
                 } else {
-                    let blk = function.new_block(format!("{:03X}", i_addr + 4));
-                    chip8.blocks.insert(i_addr + 4, blk);
-                    codegen(context, chip8, rom, i_addr + 4)?;
-                    blk
+                    let blk = function.new_block(format!("{}_{:03X}", generation, insn_address + 4));
+                    chip8.blocks.insert(insn_address + 4, blk);
+                    (codegen(context, chip8, rom, insn_address + 4, residual_mode, generation)?, blk)
                 };
 
-                let f = if let Some(blk) = chip8.blocks.get(&(i_addr + 2)) {
-                    *blk
+                let (mut f_results, f) = if let Some(blk) = chip8.blocks.get(&(insn_address + 2)) {
+                    (vec!(JitResult::EndOfProgram), *blk)
                 } else {
-                    let blk = function.new_block(format!("{:03X}", i_addr + 2));
-                    chip8.blocks.insert(i_addr + 2, blk);
-                    codegen(context, chip8, rom, i_addr + 2)?;
-                    blk
+                    let blk = function.new_block(format!("{}_{:03X}", generation, insn_address + 2));
+                    chip8.blocks.insert(insn_address + 2, blk);
+                    (codegen(context, chip8, rom, insn_address + 2, residual_mode, generation)?, blk)
                 };
 
-                let block = chip8.blocks.get(&address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", address))?;
+                let block = chip8.blocks.get(&block_address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", block_address))?;
                 block.end_with_conditional(None, conditional, t, f);
-                return Ok(());
+
+                t_results.append(&mut f_results);
+                return Ok(t_results);
             }
             (0x5, vx, vy, 0) => {
-                eprintln!("jit(0x{:03x}) emitting se V{:X}, V{:X}", i_addr, vx, vy);
+                eprintln!("jit(0x{:03x}) emitting se V{:X}, V{:X}", insn_address, vx, vy);
                 let conditional = context.new_comparison(
                     None,
                     gccjit::ComparisonOp::Equals,
@@ -369,44 +481,44 @@ pub fn codegen<'ctx>(
                     chip8.vs[vy as usize],
                 );
 
-                let t = if let Some(blk) = chip8.blocks.get(&(i_addr + 4)) {
-                    *blk
+                let (mut t_results, t) = if let Some(blk) = chip8.blocks.get(&(insn_address + 4)) {
+                    (vec!(JitResult::EndOfProgram), *blk)
                 } else {
-                    let blk = function.new_block(format!("{:03X}", i_addr + 4));
-                    chip8.blocks.insert(i_addr + 4, blk);
-                    codegen(context, chip8, rom, i_addr + 4)?;
-                    blk
+                    let blk = function.new_block(format!("{}_{:03X}", generation, insn_address + 4));
+                    chip8.blocks.insert(insn_address + 4, blk);
+                    (codegen(context, chip8, rom, insn_address + 4, residual_mode, generation)?, blk)
                 };
 
-                let f = if let Some(blk) = chip8.blocks.get(&(i_addr + 2)) {
-                    *blk
+                let (mut f_results, f) = if let Some(blk) = chip8.blocks.get(&(insn_address + 2)) {
+                    (vec!(JitResult::EndOfProgram), *blk)
                 } else {
-                    let blk = function.new_block(format!("{:03X}", i_addr + 2));
-                    chip8.blocks.insert(i_addr + 2, blk);
-                    codegen(context, chip8, rom, i_addr + 2)?;
-                    blk
+                    let blk = function.new_block(format!("{}_{:03X}", generation, insn_address + 2));
+                    chip8.blocks.insert(insn_address + 2, blk);
+                    (codegen(context, chip8, rom, insn_address + 2, residual_mode, generation)?, blk)
                 };
 
-                let block = chip8.blocks.get(&address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", address))?;
+                let block = chip8.blocks.get(&block_address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", block_address))?;
                 block.end_with_conditional(None, conditional, t, f);
-                return Ok(());
+
+                t_results.append(&mut f_results);
+                return Ok(t_results);
             }
             (0x6, vx, _, _) => {
-                eprintln!("jit(0x{:03x}) emitting ld V{:X}, #{:X}", i_addr, vx, lo);
+                eprintln!("jit(0x{:03x}) emitting ld V{:X}, #{:X}", insn_address, vx, lo);
                 let const_val = context.new_rvalue_from_int(context.new_type::<u8>(), lo as i32);
                 block.add_assignment(None, chip8.vs[vx as usize], const_val);
             }
             (0x7, vx, _, _) => {
-                eprintln!("jit(0x{:03x}) emitting add V{:X}, #{:X}", i_addr, vx, lo);
+                eprintln!("jit(0x{:03x}) emitting add V{:X}, #{:X}", insn_address, vx, lo);
                 let const_val = context.new_rvalue_from_int(context.new_type::<u8>(), lo as i32);
                 block.add_assignment_op(None, chip8.vs[vx as usize], gccjit::BinaryOp::Plus, const_val);
             }
             (0x8, vx, vy, 0x0) => {
-                eprintln!("jit(0x{:03x}) emitting ld V{:X}, V{:X}", i_addr, vx, vy);
+                eprintln!("jit(0x{:03x}) emitting ld V{:X}, V{:X}", insn_address, vx, vy);
                 block.add_assignment(None, chip8.vs[vx as usize], chip8.vs[vy as usize]);
             },
             (0x8, vx, vy, 0x1) => {
-                eprintln!("jit(0x{:03x}) emitting or V{:X}, V{:X}", i_addr, vx, vy);
+                eprintln!("jit(0x{:03x}) emitting or V{:X}, V{:X}", insn_address, vx, vy);
                 let result = context.new_binary_op(
                     None,
                     gccjit::BinaryOp::BitwiseOr,
@@ -417,7 +529,7 @@ pub fn codegen<'ctx>(
                 block.add_assignment(None, chip8.vs[vx as usize], result);
             }
             (0x8, vx, vy, 0x2) => {
-                eprintln!("jit(0x{:03x}) emitting and V{:X}, V{:X}", i_addr, vx, vy);
+                eprintln!("jit(0x{:03x}) emitting and V{:X}, V{:X}", insn_address, vx, vy);
                 let result = context.new_binary_op(
                     None,
                     gccjit::BinaryOp::BitwiseAnd,
@@ -428,7 +540,7 @@ pub fn codegen<'ctx>(
                 block.add_assignment(None, chip8.vs[vx as usize], result);
             }
             (0x8, vx, vy, 0x3) => {
-                eprintln!("jit(0x{:03x}) emitting xor V{:X}, V#{:X}", i_addr, vx, vy);
+                eprintln!("jit(0x{:03x}) emitting xor V{:X}, V#{:X}", insn_address, vx, vy);
                 let result = context.new_binary_op(
                     None,
                     gccjit::BinaryOp::BitwiseXor,
@@ -439,7 +551,7 @@ pub fn codegen<'ctx>(
                 block.add_assignment(None, chip8.vs[vx as usize], result);
             }
             (0x8, vx, vy, 0x4) => {
-                eprintln!("jit(0x{:03x}) emitting add V{:X}, V{:X}", i_addr, vx, vy);
+                eprintln!("jit(0x{:03x}) emitting add V{:X}, V{:X}", insn_address, vx, vy);
                 let result = context.new_binary_op(
                     None,
                     gccjit::BinaryOp::Plus,
@@ -450,7 +562,7 @@ pub fn codegen<'ctx>(
                 block.add_assignment(None, chip8.vs[vx as usize], result);
             }
             (0x8, vx, vy, 0x5) => {
-                eprintln!("jit(0x{:03x}) emitting sub V{:X}, V{:X}", i_addr, vx, vy);
+                eprintln!("jit(0x{:03x}) emitting sub V{:X}, V{:X}", insn_address, vx, vy);
                 let result = context.new_binary_op(
                     None,
                     gccjit::BinaryOp::Minus,
@@ -461,7 +573,7 @@ pub fn codegen<'ctx>(
                 block.add_assignment(None, chip8.vs[vx as usize], result);
             }
             (0x8, vx, vy, 0x6) => {
-                eprintln!("jit(0x{:03x}) emitting shr V{:X}, (V{:X})", i_addr, vx, vy);
+                eprintln!("jit(0x{:03x}) emitting shr V{:X}, (V{:X})", insn_address, vx, vy);
                 let const_mask = context.new_rvalue_from_int(context.new_type::<u8>(), 0x1 as i32);
                 let const_shift = context.new_rvalue_from_int(context.new_type::<u8>(), 0x1 as i32);
                 let carry = context.new_binary_op(
@@ -482,7 +594,7 @@ pub fn codegen<'ctx>(
                 block.add_assignment(None, chip8.vs[0xF], carry);
             }
             (0x8, vx, vy, 0x7) => {
-                eprintln!("jit(0x{:03x}) emitting subn V{:X}, V{:X}", i_addr, vx, vy);
+                eprintln!("jit(0x{:03x}) emitting subn V{:X}, V{:X}", insn_address, vx, vy);
                 let carry = context.new_comparison(
                     None,
                     gccjit::ComparisonOp::GreaterThan,
@@ -500,7 +612,7 @@ pub fn codegen<'ctx>(
                 block.add_assignment(None, chip8.vs[0xF], context.new_cast(None, carry, context.new_type::<u8>()));
             }
             (0x8, vx, vy, 0xE) => {
-                eprintln!("jit(0x{:03x}) emitting shl V{:X}, (V{:X})", i_addr, vx, vy);
+                eprintln!("jit(0x{:03x}) emitting shl V{:X}, (V{:X})", insn_address, vx, vy);
                 let const_mask = context.new_rvalue_from_int(context.new_type::<u8>(), 0x80 as i32);
                 let const_mask_shift = context.new_rvalue_from_int(context.new_type::<u8>(), 7 as i32);
                 let const_shift = context.new_rvalue_from_int(context.new_type::<u8>(), 0x1 as i32);
@@ -530,7 +642,7 @@ pub fn codegen<'ctx>(
                 block.add_assignment(None, chip8.vs[0xF], carry);
             }
             (0x9, vx, vy, 0) => {
-                eprintln!("jit(0x{:03x}) emitting sne V{:X}, V{:X}", i_addr, vx, vy);
+                eprintln!("jit(0x{:03x}) emitting sne V{:X}, V{:X}", insn_address, vx, vy);
                 let conditional = context.new_comparison(
                     None,
                     gccjit::ComparisonOp::NotEquals,
@@ -538,42 +650,43 @@ pub fn codegen<'ctx>(
                     chip8.vs[vy as usize],
                 );
 
-                let t = if let Some(blk) = chip8.blocks.get(&(i_addr + 4)) {
-                    *blk
+
+                let (mut t_results, t) = if let Some(blk) = chip8.blocks.get(&(insn_address + 4)) {
+                    (vec!(JitResult::EndOfProgram), *blk)
                 } else {
-                    let blk = function.new_block(format!("{:03X}", i_addr + 4));
-                    chip8.blocks.insert(i_addr + 4, blk);
-                    codegen(context, chip8, rom, i_addr + 4)?;
-                    blk
+                    let blk = function.new_block(format!("{}_{:03X}", generation, insn_address + 4));
+                    chip8.blocks.insert(insn_address + 4, blk);
+                    (codegen(context, chip8, rom, insn_address + 4, residual_mode, generation)?, blk)
                 };
 
-                let f = if let Some(blk) = chip8.blocks.get(&(i_addr + 2)) {
-                    *blk
+                let (mut f_results, f) = if let Some(blk) = chip8.blocks.get(&(insn_address + 2)) {
+                    (vec!(JitResult::EndOfProgram), *blk)
                 } else {
-                    let blk = function.new_block(format!("{:03X}", i_addr + 2));
-                    chip8.blocks.insert(i_addr + 2, blk);
-                    codegen(context, chip8, rom, i_addr + 2)?;
-                    blk
+                    let blk = function.new_block(format!("{}_{:03X}", generation, insn_address + 2));
+                    chip8.blocks.insert(insn_address + 2, blk);
+                    (codegen(context, chip8, rom, insn_address + 2, residual_mode, generation)?, blk)
                 };
 
-                let block = chip8.blocks.get(&address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", address))?;
+                let block = chip8.blocks.get(&block_address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", block_address))?;
                 block.end_with_conditional(None, conditional, t, f);
-                return Ok(());
+
+                t_results.append(&mut f_results);
+                return Ok(t_results);
             }
             (0xA, x, y, z) => {
                 let addr = ((x as u16) << 8) | ((y as u16) << 4) | (z as u16);
-                eprintln!("jit(0x{:03x}) emitting ld I, #{:X}", i_addr, addr);
+                eprintln!("jit(0x{:03x}) emitting ld I, #{:X}", insn_address, addr);
                 let const_val = context.new_rvalue_from_int(context.new_type::<u16>(), addr as i32);
                 block.add_assignment(None, chip8.i, const_val);
             }
             (0xB, x, y, z) => {
                 let addr = ((x as u16) << 8) | ((y as u16) << 4) | (z as u16);
-                eprintln!("jit(0x{:03x}) emitting jp V0 #{:X} (return to host)", i_addr, addr);
+                eprintln!("jit(0x{:03x}) emitting jp V0 #{:X} (return to host)", insn_address, addr);
                 block.end_with_void_return(None);
-                return Ok(());
+                return Ok(vec!(JitResult::DynamicJump { pc: addr }.into()));
             }
             (0xC, vx, _, _) => {
-                eprintln!("jit(0x{:03x}) emitting rnd V{:X}, #{:X}", i_addr, vx, lo);
+                eprintln!("jit(0x{:03x}) emitting rnd V{:X}, #{:X}", insn_address, vx, lo);
                 let const_mask = context.new_rvalue_from_int(context.new_type::<u8>(), lo as i32);
                 let rand_result = context.new_call(None, chip8.rnd, &[]);
                 let and_result = context.new_binary_op(
@@ -586,7 +699,7 @@ pub fn codegen<'ctx>(
                 block.add_assignment(None, chip8.vs[vx as usize], and_result);
             }
             (0xD, vx, vy, n) => {
-                eprintln!("jit(0x{:03x}) emitting drw V{:X}, V{:X}, #{:X}", i_addr, vx, vy, n);
+                eprintln!("jit(0x{:03x}) emitting drw V{:X}, V{:X}, #{:X}", insn_address, vx, vy, n);
                 let const_n = context.new_rvalue_from_int(context.new_type::<u8>(), n as i32);
 
                 let intersection = context.new_call(None, chip8.drw, &[
@@ -600,33 +713,33 @@ pub fn codegen<'ctx>(
                 block.add_assignment(None, chip8.vs[0xF], intersection);
             }
             (0xE, vx, 0x9, 0xE) => {
-                eprintln!("jit(0x{:03x}) emitting skp V{:X}", i_addr, vx);
+                eprintln!("jit(0x{:03x}) emitting skp V{:X}", insn_address, vx);
                 let is_pressed = context.new_call(None, chip8.kp, &[chip8.vs[vx as usize].to_rvalue()]);
 
-                let t = if let Some(blk) = chip8.blocks.get(&(i_addr + 4)) {
-                    *blk
+                let (mut t_results, t) = if let Some(blk) = chip8.blocks.get(&(insn_address + 4)) {
+                    (vec!(JitResult::EndOfProgram), *blk)
                 } else {
-                    let blk = function.new_block(format!("{:03X}", i_addr + 4));
-                    chip8.blocks.insert(i_addr + 4, blk);
-                    codegen(context, chip8, rom, i_addr + 4)?;
-                    blk
+                    let blk = function.new_block(format!("{}_{:03X}", generation, insn_address + 4));
+                    chip8.blocks.insert(insn_address + 4, blk);
+                    (codegen(context, chip8, rom, insn_address + 4, residual_mode, generation)?, blk)
                 };
 
-                let f = if let Some(blk) = chip8.blocks.get(&(i_addr + 2)) {
-                    *blk
+                let (mut f_results, f) = if let Some(blk) = chip8.blocks.get(&(insn_address + 2)) {
+                    (vec!(JitResult::EndOfProgram), *blk)
                 } else {
-                    let blk = function.new_block(format!("{:03X}", i_addr + 2));
-                    chip8.blocks.insert(i_addr + 2, blk);
-                    codegen(context, chip8, rom, i_addr + 2)?;
-                    blk
+                    let blk = function.new_block(format!("{}_{:03X}", generation, insn_address + 2));
+                    chip8.blocks.insert(insn_address + 2, blk);
+                    (codegen(context, chip8, rom, insn_address + 2, residual_mode, generation)?, blk)
                 };
 
-                let block = chip8.blocks.get(&address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", address))?;
+                let block = chip8.blocks.get(&block_address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", block_address))?;
                 block.end_with_conditional(None, context.new_cast(None, is_pressed, context.new_type::<bool>()), t, f);
-                return Ok(());
+
+                t_results.append(&mut f_results);
+                return Ok(t_results);
             }
             (0xE, vx, 0xA, 0x1) => {
-                eprintln!("jit(0x{:03x}) emitting sknp V{:X}", i_addr, vx);
+                eprintln!("jit(0x{:03x}) emitting sknp V{:X}", insn_address, vx);
                 let is_pressed = context.new_call(None, chip8.kp, &[chip8.vs[vx as usize].to_rvalue()]);
                 let is_not_pressed = context.new_unary_op(
                     None,
@@ -635,70 +748,71 @@ pub fn codegen<'ctx>(
                     context.new_cast(None, is_pressed, context.new_type::<bool>())
                 );
 
-                let t = if let Some(blk) = chip8.blocks.get(&(i_addr + 4)) {
-                    *blk
+
+                let (mut t_results, t) = if let Some(blk) = chip8.blocks.get(&(insn_address + 4)) {
+                    (vec!(JitResult::EndOfProgram), *blk)
                 } else {
-                    let blk = function.new_block(format!("{:03X}", i_addr + 4));
-                    chip8.blocks.insert(i_addr + 4, blk);
-                    codegen(context, chip8, rom, i_addr + 4)?;
-                    blk
+                    let blk = function.new_block(format!("{}_{:03X}", generation, insn_address + 4));
+                    chip8.blocks.insert(insn_address + 4, blk);
+                    (codegen(context, chip8, rom, insn_address + 4, residual_mode, generation)?, blk)
                 };
 
-                let f = if let Some(blk) = chip8.blocks.get(&(i_addr + 2)) {
-                    *blk
+                let (mut f_results, f) = if let Some(blk) = chip8.blocks.get(&(insn_address + 2)) {
+                    (vec!(JitResult::EndOfProgram), *blk)
                 } else {
-                    let blk = function.new_block(format!("{:03X}", i_addr + 2));
-                    chip8.blocks.insert(i_addr + 2, blk);
-                    codegen(context, chip8, rom, i_addr + 2)?;
-                    blk
+                    let blk = function.new_block(format!("{}_{:03X}", generation, insn_address + 2));
+                    chip8.blocks.insert(insn_address + 2, blk);
+                    (codegen(context, chip8, rom, insn_address + 2, residual_mode, generation)?, blk)
                 };
 
-                let block = chip8.blocks.get(&address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", address))?;
+                let block = chip8.blocks.get(&block_address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", block_address))?;
                 block.end_with_conditional(None, is_not_pressed, t, f);
-                return Ok(());
+
+                t_results.append(&mut f_results);
+                return Ok(t_results);
             }
             (0xF, vx, 0x0, 0x7) => {
-                eprintln!("jit(0x{:03x}) emitting ld V{:X}, DT", i_addr, vx);
+                eprintln!("jit(0x{:03x}) emitting ld V{:X}, DT", insn_address, vx);
                 let dt_result = context.new_call(None, chip8.lddt, &[]);
                 block.add_assignment(None, chip8.vs[vx as usize], dt_result);
             }
             (0xF, vx, 0x0, 0xA) => {
-                eprintln!("jit(0x{:03x}) emitting bkp V{:X}", i_addr, vx);
+                eprintln!("jit(0x{:03x}) emitting bkp V{:X}", insn_address, vx);
                 let key_result = context.new_call(None, chip8.bkp, &[]);
                 block.add_assignment(None, chip8.vs[vx as usize], key_result);
             }
             (0xF, vx, 0x1, 0x5) => {
-                eprintln!("jit(0x{:03x}) emitting ld DT, V{:X}", i_addr, vx);
+                eprintln!("jit(0x{:03x}) emitting ld DT, V{:X}", insn_address, vx);
                 let dt_result = context.new_call(None, chip8.stdt, &[chip8.vs[vx as usize].to_rvalue()]);
                 block.add_eval(None, dt_result);
             }
             (0xF, vx, 0x1, 0x8) => {
-                eprintln!("jit(0x{:03x}) emitting ld ST, V{:X} (TODO)", i_addr, vx);
+                eprintln!("jit(0x{:03x}) emitting ld ST, V{:X} (TODO)", insn_address, vx);
             }
             (0xF, vx, 0x1, 0xE) => {
-                eprintln!("jit(0x{:03x}) emitting add I, V{:X}", i_addr, vx);
+                eprintln!("jit(0x{:03x}) emitting add I, V{:X}", insn_address, vx);
                 let cast = context.new_cast(None, chip8.vs[vx as usize], context.new_type::<u16>());
                 block.add_assignment_op(None, chip8.i, gccjit::BinaryOp::Plus, cast);
             }
             (0xF, vx, 0x2, 0x9) => {
-                eprintln!("jit(0x{:03x}) emitting fld I, V{:X}", i_addr, vx);
+                eprintln!("jit(0x{:03x}) emitting fld I, V{:X}", insn_address, vx);
                 let const_font_offset = context.new_rvalue_from_int(context.new_type::<u8>(), 0x50 as i32);
-                let font_address = context.new_binary_op(
+                let font_addr = context.new_binary_op(
                     None,
                     gccjit::BinaryOp::Plus,
                     context.new_type::<u16>(),
                     const_font_offset,
                     chip8.vs[vx as usize],
                 );
-                block.add_assignment(None, chip8.i, font_address);
+                block.add_assignment(None, chip8.i, font_addr);
             }
             (0xF, vx, 0x3, 0x3) => {
-                eprintln!("jit(0x{:03x}) emitting bcd [I], V{:X} (flushing jit cache)", i_addr, vx);
+                eprintln!("jit(0x{:03x}) emitting bcd [I], V{:X} (flushing jit cache)", insn_address, vx);
                 let const_hundred = context.new_rvalue_from_int(context.new_type::<u8>(), 100 as i32);
                 let const_ten = context.new_rvalue_from_int(context.new_type::<u8>(), 10 as i32);
-                let const_zero = context.new_rvalue_from_int(context.new_type::<u8>(), 0 as i32);
-                let const_one = context.new_rvalue_from_int(context.new_type::<u8>(), 1 as i32);
-                let const_two = context.new_rvalue_from_int(context.new_type::<u8>(), 2 as i32);
+                let const_zero = context.new_rvalue_from_int(context.new_type::<u16>(), 0 as i32);
+                let const_one = context.new_rvalue_from_int(context.new_type::<u16>(), 1 as i32);
+                let const_two = context.new_rvalue_from_int(context.new_type::<u16>(), 2 as i32);
                 let hundreds_digit = context.new_binary_op(
                     None,
                     gccjit::BinaryOp::Divide,
@@ -726,24 +840,57 @@ pub fn codegen<'ctx>(
                     chip8.vs[vx as usize],
                     const_ten,
                 );
-                let hundreds_loc = context.new_array_access(None, chip8.mem, const_zero);
-                let tens_loc = context.new_array_access(None, chip8.mem, const_one);
-                let ones_loc = context.new_array_access(None, chip8.mem, const_two);
+                let hundreds_loc = context.new_array_access(
+                    None,
+                    chip8.mem,
+                    context.new_binary_op(
+                        None,
+                        gccjit::BinaryOp::Plus,
+                        context.new_type::<u16>(),
+                        chip8.i,
+                        const_zero
+                    )
+                );
+                let tens_loc = context.new_array_access(
+                    None,
+                    chip8.mem,
+                    context.new_binary_op(
+                        None,
+                        gccjit::BinaryOp::Plus,
+                        context.new_type::<u16>(),
+                        chip8.i,
+                        const_one
+                    )
+                );
+                let ones_loc = context.new_array_access(
+                    None,
+                    chip8.mem,
+                    context.new_binary_op(
+                        None,
+                        gccjit::BinaryOp::Plus,
+                        context.new_type::<u16>(),
+                        chip8.i,
+                        const_two
+                    )
+                );
                 block.add_assignment(None, hundreds_loc, hundreds_digit);
                 block.add_assignment(None, tens_loc, tens_digit);
                 block.add_assignment(None, ones_loc, ones_digit);
+                block.end_with_void_return(None);
+                return Ok(vec!(JitResult::SelfModifyingCode { pc: insn_address + 2, len: 3 }.into()));
             }
             (0xF, vx, 0x5, 0x5) => {
-                eprintln!("jit(0x{:03x}) emitting ld [I], V{:X} (flushing jit cache)", i_addr, vx);
+                eprintln!("jit(0x{:03x}) emitting ld [I], V{:X} (flushing jit cache)", insn_address, vx);
                 for v in 0..=vx {
                     let const_offset = context.new_rvalue_from_int(context.new_type::<u16>(), v as i32);
                     let loc = context.new_array_access(None, chip8.mem, const_offset);
                     block.add_assignment(None, loc, chip8.vs[v as usize]);
-
                 }
+                block.end_with_void_return(None);
+                return Ok(vec!(JitResult::SelfModifyingCode { pc: insn_address + 2, len: vx as usize + 1 }.into()));
             }
             (0xF, vx, 0x6, 0x5) => {
-                eprintln!("jit(0x{:03x}) emitting ld V{:X}, [I]", i_addr, vx);
+                eprintln!("jit(0x{:03x}) emitting ld V{:X}, [I]", insn_address, vx);
                 for v in 0..=vx {
                     let const_offset = context.new_rvalue_from_int(context.new_type::<u16>(), v as i32);
                     let loc = context.new_array_access(None, chip8.mem, const_offset);
@@ -751,15 +898,15 @@ pub fn codegen<'ctx>(
                 }
             }
             _ => {
-                eprintln!("jit(0x{:03x}) unknown insn {:X} {:X}, aborting", i_addr, hi, lo);
-                return Ok(());
+                eprintln!("jit(0x{:03x}) unknown insn {:X} {:X}, aborting", insn_address, hi, lo);
+                return Ok(vec!(JitResult::EndOfProgram));
             }
         }
     }
     {
         eprintln!("jit: returning for end of rom");
-        let block = chip8.blocks.get(&address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", address))?;
+        let block = chip8.blocks.get(&block_address).ok_or(anyhow::anyhow!("chip8.blocks addr {:X} missing", block_address))?;
         block.end_with_void_return(None);
-        Ok(())
+        Ok(vec!(JitResult::EndOfProgram))
     }
 }
