@@ -249,6 +249,7 @@ pub fn recompile_rom<'ctx>(
 }
 
 #[no_mangle]
+#[inline(never)]
 #[export_name = "rnd"]
 pub extern "C" fn rnd() -> u8 {
     rand::random::<u8>()

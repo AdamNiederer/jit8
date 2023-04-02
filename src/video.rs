@@ -15,6 +15,7 @@ const VERTICES: &[f32] = &[
 static DISPLAY_MATRIX: std::sync::RwLock<[u32; 64 * 32]> = std::sync::RwLock::new([1; 64 * 32]);
 
 #[no_mangle]
+#[inline(never)]
 #[export_name = "cls"]
 pub extern "C" fn cls() {
     eprintln!("video: cls");
@@ -25,6 +26,7 @@ pub extern "C" fn cls() {
 }
 
 #[no_mangle]
+#[inline(never)]
 #[export_name = "drw"]
 pub extern "C" fn drw(mem_ptr: *const std::ffi::c_uchar, x: u8, y: u8, i: u16, n: u8) -> u8 {
     eprintln!("video: drw 0x{:x} 0x{:x} 0x{:x} 0x{:x}", i, x, y, n);

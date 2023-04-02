@@ -6,6 +6,7 @@ static DELAY_TIMER: RwLock<Lazy<Instant>> = RwLock::new(Lazy::new(|| Instant::no
 static DELAY_VALUE: RwLock<u8> = RwLock::new(0);
 
 #[no_mangle]
+#[inline(never)]
 #[export_name = "stdt"]
 pub extern "C" fn stdt(val: u8) {
     // eprintln!("timers: stdt");
@@ -16,6 +17,7 @@ pub extern "C" fn stdt(val: u8) {
 }
 
 #[no_mangle]
+#[inline(never)]
 #[export_name = "lddt"]
 pub extern "C" fn lddt() -> u8 {
     // eprintln!("timers: lddt");

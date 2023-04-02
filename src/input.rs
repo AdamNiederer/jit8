@@ -27,14 +27,14 @@ pub fn keycode_to_index(key: VirtualKeyCode) -> Option<usize> {
 }
 
 #[no_mangle]
-#[export_name = "kp"]
 #[inline(never)]
+#[export_name = "kp"]
 pub extern "C" fn kp(key: u8) -> u8 {
     let reader = KEYPAD.read().unwrap();
     if key >= 16 {
         eprintln!("input: kp invalid key: {}", key);
     }
-    eprintln!("kp: {}={}", key, reader[(key % 16) as usize]);
+    // eprintln!("kp: {}={}", key, reader[(key % 16) as usize]);
     let ret = reader[(key % 16) as usize];
     drop(reader);
     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -51,6 +51,7 @@ fn is_pressed(old: &[u8], new: &[u8]) -> Option<usize> {
 }
 
 #[no_mangle]
+#[inline(never)]
 #[export_name = "bkp"]
 pub extern "C" fn bkp() -> u8 {
     eprintln!("bkp: waiting");
