@@ -19,8 +19,8 @@ pub fn keycode_to_index(key: VirtualKeyCode) -> Option<usize> {
         VirtualKeyCode::D => Some(0x8),
         VirtualKeyCode::F => Some(0xE),
         VirtualKeyCode::Z => Some(0x9),
-        VirtualKeyCode::X => Some(0x10),
-        VirtualKeyCode::C => Some(0x11),
+        VirtualKeyCode::X => Some(0xA),
+        VirtualKeyCode::C => Some(0xB),
         VirtualKeyCode::V => Some(0xF),
         _ => None
     }
@@ -28,6 +28,7 @@ pub fn keycode_to_index(key: VirtualKeyCode) -> Option<usize> {
 
 #[no_mangle]
 #[export_name = "kp"]
+#[inline(never)]
 pub extern "C" fn kp(key: u8) -> u8 {
     let reader = KEYPAD.read().unwrap();
     if key >= 16 {
@@ -36,7 +37,7 @@ pub extern "C" fn kp(key: u8) -> u8 {
     eprintln!("kp: {}={}", key, reader[(key % 16) as usize]);
     let ret = reader[(key % 16) as usize];
     drop(reader);
-    std::thread::sleep(std::time::Duration::from_millis(1));
+    std::thread::sleep(std::time::Duration::from_millis(10));
     ret
 }
 
