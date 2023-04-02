@@ -1,7 +1,6 @@
 # Project related
 data/
-roms/
-*.ch8
+**/*.ch8
 chip8/
 
 # Builds
@@ -15,6 +14,11 @@ target/
 .*.swo
 *.tmp
 *.bak
+
+# JIT Dumps
+*.dot
+*.svg
+*.png
 
 # OS X
 .DS_Store
