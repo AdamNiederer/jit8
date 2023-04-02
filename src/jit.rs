@@ -892,8 +892,19 @@ pub fn codegen<'ctx>(
             (0xF, vx, 0x6, 0x5) => {
                 eprintln!("jit(0x{:03x}) emitting ld V{:X}, [I]", insn_address, vx);
                 for v in 0..=vx {
-                    let const_offset = context.new_rvalue_from_int(context.new_type::<u16>(), v as i32);
-                    let loc = context.new_array_access(None, chip8.mem, const_offset);
+                    let const_reg = context.new_rvalue_from_int(context.new_type::<u16>(), v as i32);
+                    let offset = context.new_array_access(
+                        None,
+                        chip8.mem,
+                        context.new_binary_op(
+                            None,
+                            gccjit::BinaryOp::Plus,
+                            context.new_type::<u16>(),
+                            chip8.i,
+                            const_reg
+                        )
+                    );
+                    let loc = context.new_array_access(None, chip8.mem, offset);
                     block.add_assignment(None, chip8.vs[v as usize], loc);
                 }
             }
