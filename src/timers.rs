@@ -21,5 +21,5 @@ pub extern "C" fn lddt() -> u8 {
     // eprintln!("timers: lddt");
     let timer = DELAY_TIMER.read().unwrap();
     let value = DELAY_VALUE.read().unwrap();
-    *value - ((Instant::now().duration_since(**timer).as_millis() as f32 / 16.666) as u8)
+    value.saturating_sub((Instant::now().duration_since(**timer).as_millis() as f32 / 16.666) as u8)
 }
