@@ -6,7 +6,7 @@ mod timers;
 fn main() {
     std::thread::spawn(|| {
         let context = gccjit::Context::default();
-        context.set_optimization_level(gccjit::OptimizationLevel::Limited);
+        context.set_optimization_level(gccjit::OptimizationLevel::None);
         context.set_dump_code_on_compile(false);
         let mut chip8 = jit::Chip8State::new(&context);
         jit::recompile_rom(&context, &mut chip8, "chip8-test-suite.ch8").unwrap()
