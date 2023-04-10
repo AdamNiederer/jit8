@@ -2,6 +2,8 @@ use gccjit;
 use gccjit::ToRValue as _;
 use std::collections::HashMap;
 
+static PREV_MEM: std::sync::RwLock<[u8; 4096]> = std::sync::RwLock::new([0; 4096]);
+
 pub struct Chip8State<'ctx> {
     pub i: gccjit::LValue<'ctx>,
     pub vs: Vec<gccjit::LValue<'ctx>>,
@@ -22,6 +24,7 @@ pub struct Chip8State<'ctx> {
     pub lddt: gccjit::Function<'ctx>,
     pub stdt: gccjit::Function<'ctx>,
     pub ill: gccjit::Function<'ctx>,
+    pub load_mem: gccjit::Function<'ctx>,
 }
 
 static FONT: [u8; 80] = [
@@ -188,6 +191,14 @@ impl<'ctx> Chip8State<'ctx> {
             false
         );
 
+        let load_mem = context.new_function(
+            None,
+            gccjit::FunctionType::Extern,
+            context.new_type::<()>(),
+            &[context.new_parameter(None, context.new_type::<*mut u8>(), "mem")],
+            "load_mem",
+            false
+        );
 
         Chip8State {
             i,
@@ -209,6 +220,7 @@ impl<'ctx> Chip8State<'ctx> {
             lddt,
             stdt,
             ill,
+            load_mem,
         }
     }
 }
@@ -313,8 +325,6 @@ pub fn recompile_rom<'ctx>(
     let mut residual_mode = false;
     let mut previous_execution: Option<ExecutionResult> = None;
     loop {
-        // TODO: Transfer all vars from the last execuation into the new execution; nothing is saved!
-        // TODO: That's very slow so also try to detect what the furthest extent of executable code is and don't return to host when writing beyond that
         eprintln!("jit: jitting at addr {:03X}", address);
         compile_call(context, chip8, rom.as_slice(), address, residual_mode, generation, &previous_execution)?;
         eprintln!("jit: compiling");
@@ -341,18 +351,18 @@ pub fn recompile_rom<'ctx>(
             JitResult::MemoryWrite => {
                 let execution_result = get_result(&compile_result);
 
-                eprint!("jit: memdump(   ): ");
-                for j in 0..64 {
-                    eprint!("{:02X} ", j);
-                }
-                    eprintln!("");
-                for j in 0..64 {
-                    eprint!("jit: memdump({:03X}): ", j * 64);
-                    for k in 0..64 {
-                        eprint!("{:02X} ", execution_result.mem[j * 64 + k]);
-                    }
-                    eprintln!("");
-                }
+                // eprint!("jit: memdump(   ): ");
+                // for j in 0..64 {
+                //     eprint!("{:02X} ", j);
+                // }
+                //     eprintln!("");
+                // for j in 0..64 {
+                //     eprint!("jit: memdump({:03X}): ", j * 64);
+                //     for k in 0..64 {
+                //         eprint!("{:02X} ", execution_result.mem[j * 64 + k]);
+                //     }
+                //     eprintln!("");
+                // }
 
                 let rom_addr = execution_result.i as usize - 0x200;
 
@@ -407,6 +417,16 @@ pub extern "C" fn rnd() -> u8 {
 
 #[no_mangle]
 #[inline(never)]
+#[export_name = "load_mem"]
+pub extern "C" fn load_mem(mem: *mut u8) {
+    let mem_slice = unsafe { std::slice::from_raw_parts_mut(mem, 4096) };
+    for i in 0..4096 {
+        mem_slice[i] = PREV_MEM.read().unwrap()[i];
+    }
+}
+
+#[no_mangle]
+#[inline(never)]
 #[export_name = "ill"]
 pub extern "C" fn ill() -> u8 {
     panic!("SIGILL")
@@ -456,13 +476,10 @@ pub fn copy_from_previous_execution<'ctx>(
     chip8: &mut Chip8State<'ctx>,
     execution_result: &ExecutionResult,
     block: &gccjit::Block<'ctx>,
-) {
-    for (i, byte) in execution_result.mem.iter().enumerate() {
-        let const_byte = context.new_rvalue_from_int(context.new_type::<u8>(), *byte as i32);
-        let const_offset = context.new_rvalue_from_int(context.new_type::<usize>(), i as i32);
-        let array = context.new_array_access(None, chip8.mem, const_offset);
-        block.add_assignment(None, array, const_byte);
-    }
+) -> Result<(), anyhow::Error> {
+    PREV_MEM.write().unwrap().copy_from_slice(&execution_result.mem);
+    let load_mem_call = context.new_call(None, chip8.load_mem, &[chip8.mem.get_address(None)]);
+    block.add_eval(None, load_mem_call);
 
     for i in 0..16 {
         let const_byte = context.new_rvalue_from_int(context.new_type::<u8>(), execution_result.vs[i] as i32);
@@ -486,6 +503,7 @@ pub fn copy_from_previous_execution<'ctx>(
     block.add_assignment(None, chip8.next_pc, const_next_pc);
     block.add_assignment(None, chip8.write_len, const_write_len);
     block.add_assignment(None, chip8.ret, const_ret);
+    Ok(())
 }
 
 pub fn bootstrap<'ctx>(
@@ -493,21 +511,20 @@ pub fn bootstrap<'ctx>(
     chip8: &mut Chip8State<'ctx>,
     rom: &[u8],
     block: &gccjit::Block<'ctx>,
-) {
-    // Initial loading
+) -> Result<(), anyhow::Error> {
+    let mut writer = PREV_MEM.write().unwrap();
     for (i, byte) in FONT.iter().enumerate() {
-        let const_byte = context.new_rvalue_from_int(context.new_type::<u8>(), *byte as i32);
-        let const_mem_offset = context.new_rvalue_from_int(context.new_type::<usize>(), (0x50 + i) as i32);
-        let array = context.new_array_access(None, chip8.mem, const_mem_offset);
-        block.add_assignment(None, array, const_byte);
+        writer[0x50 + i] = *byte;
     }
 
     for (i, byte) in rom.iter().enumerate() {
-        let const_byte = context.new_rvalue_from_int(context.new_type::<u8>(), *byte as i32);
-        let const_mem_offset = context.new_rvalue_from_int(context.new_type::<usize>(), (512 + i) as i32);
-        let array = context.new_array_access(None, chip8.mem, const_mem_offset);
-        block.add_assignment(None, array, const_byte);
+        writer[0x200 + i] = *byte;
     }
+
+    let load_mem_call = context.new_call(None, chip8.load_mem, &[chip8.mem.get_address(None)]);
+    block.add_eval(None, load_mem_call);
+
+    Ok(())
 }
 
 pub fn codegen<'ctx>(
