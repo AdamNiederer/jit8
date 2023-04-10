@@ -247,16 +247,18 @@ fn get_result<'ctx>(compile_result: &'ctx gccjit::CompileResult) -> ExecutionRes
     } else {
         panic!("failed to get i pointer")
     };
-    let vs: Vec<u8> = if !mem_result.is_null() {
+    let vs: Vec<u8> = {
         let mut vs = Vec::with_capacity(16);
         unsafe { vs.set_len(16) };
 
         for i in 0..16 {
-            vs[i] = unsafe { *std::mem::transmute::<*mut (), *mut u8>(v_results[i]) };
+            if !v_results[i].is_null() {
+                vs[i] = unsafe { *std::mem::transmute::<*mut (), *mut u8>(v_results[i]) };
+            } else {
+                panic!("failed to get v[{}] pointer", i)
+            }
         }
         vs
-    } else {
-        panic!("failed to get mem pointer")
     };
     let mem: Vec<u8> = if !mem_result.is_null() {
         unsafe { std::slice::from_raw_parts_mut(std::mem::transmute(mem_result), 4096).to_owned() }
